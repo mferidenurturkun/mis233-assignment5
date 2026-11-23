@@ -7,7 +7,6 @@ export const users = sqliteTable("users", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   email: text("email").notNull().unique(),
   passwordHash: text("password_hash").notNull(),
-  // A SQL default runs for every row. A JavaScript Date.now() here would run once.
   createdAt: integer("created_at").notNull().default(sql`(strftime('%s','now'))`),
 });
 
@@ -18,5 +17,16 @@ export const sessions = sqliteTable("sessions", {
   expiresAt: integer("expires_at").notNull(),
 });
 
-// TODO R2: define `tasks` the same way. Status is a text column restricted to
-// "todo" | "in-progress" | "done". A task belongs to one user (userId).
+// R2: tasks tablosu — her görev bir kullanıcıya aittir
+export const tasks = sqliteTable("tasks", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  userId: integer("user_id").notNull().references(() => users.id),
+  title: text("title").notNull(),
+  status: text("status", { enum: ["todo", "in-progress", "done"] })
+    .notNull()
+    .default("todo"),
+  priority: text("priority", { enum: ["low", "medium", "high"] })
+    .notNull()
+    .default("medium"),
+  createdAt: integer("created_at").notNull().default(sql`(strftime('%s','now'))`),
+});
