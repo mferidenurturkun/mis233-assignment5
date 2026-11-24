@@ -29,6 +29,20 @@ export async function userIdFromToken(db: Db, token: string): Promise<number | n
   return id === undefined ? null : Number(id);
 }
 
+import type { MiddlewareHandler } from "hono";
+
+export type Env = { Variables: { userId: number } };
+
+/** Token'ı okur, geçerliyse userId'yi context'e yazar, değilse 401 döner. */
+export const requireAuth = (db: Db): MiddlewareHandler<Env> =>
+  async (c, next) => {
+    const token = (c.req.header("authorization") ?? "").replace("Bearer ", "");
+    const id = await userIdFromToken(db, token);
+    if (id === null) return c.json({ error: "unauthorized" }, 401);
+    c.set("userId", id);
+    await next();
+  };
+
 // TODO R3: write a Hono middleware factory `requireAuth(db)` that reads "Authorization: Bearer <token>",
 // answers 401 when it is missing or unknown (use userIdFromToken), and otherwise stores the
 // user id with c.set("userId", id) so that the routes can use it.
