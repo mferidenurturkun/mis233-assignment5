@@ -15,6 +15,9 @@ type OwnedTaskResult =
   | { ok: true; task: typeof tasks.$inferSelect }
   | { ok: false; status: 403 | 404; message: string };
 
+type RateEntry = { count: number; resetAt: number };
+type CacheEntry<T> = { value: T; expiresAt: number };
+
 /** Build the whole application around a database, so tests can give it their own. */
 export function createApp(db: Db) {
   const app = new Hono<Env>();
@@ -27,8 +30,167 @@ export function createApp(db: Db) {
     issues?: unknown[],
   ) => c.json({ error: message, ...(issues ? { issues } : {}) }, status);
 
+  // ── Bonus 2: Rate Limit & Cache ─────────────────────────────────────────
+  const rateBuckets = new Map<string, RateEntry>();
+  const RATE_WINDOW_MS = 60_000;
+  const RATE_MAX_REQUESTS = 120;
+
+  app.use("*", async (c, next) => {
+    const clientKey =
+      c.req.header("x-forwarded-for")?.split(",")[0]?.trim() ||
+      c.req.header("x-real-ip") ||
+      "local";
+    const now = Date.now();
+    const current = rateBuckets.get(clientKey);
+
+    if (!current || now >= current.resetAt) {
+      rateBuckets.set(clientKey, { count: 1, resetAt: now + RATE_WINDOW_MS });
+    } else {
+      current.count += 1;
+      if (current.count > RATE_MAX_REQUESTS) {
+        const retryAfterSec = Math.max(1, Math.ceil((current.resetAt - now) / 1000));
+        c.header("Retry-After", String(retryAfterSec));
+        return fail(c, 429, "rate limit exceeded");
+      }
+    }
+
+    await next();
+  });
+
+  const taskCache = new Map<string, CacheEntry<unknown>>();
+  const CACHE_TTL_MS = 10_000;
+
+  function invalidateUserTaskCache(userId: number) {
+    const prefix = `u:${userId}:`;
+    for (const key of taskCache.keys()) {
+      if (key.startsWith(prefix)) {
+        taskCache.delete(key);
+      }
+    }
+  }
+
   // ── Health ──────────────────────────────────────────────────────────────
   app.get("/health", (c) => c.json({ ok: true }));
+
+  // ── Bonus 1: OpenAPI 3.0 spec ──────────────────────────────────────────
+  app.get("/openapi.json", (c) => {
+    return c.json({
+      openapi: "3.0.0",
+      info: {
+        title: "Tasks API",
+        version: "1.0.0",
+        description: "Authenticated Tasks REST API built with Hono, Zod, and Drizzle ORM.",
+      },
+      components: {
+        securitySchemes: {
+          bearerAuth: {
+            type: "http",
+            scheme: "bearer",
+          },
+        },
+        schemas: {
+          Credentials: {
+            type: "object",
+            required: ["email", "password"],
+            properties: {
+              email: { type: "string", format: "email" },
+              password: { type: "string", minLength: 8 },
+            },
+          },
+          CreateTask: {
+            type: "object",
+            required: ["title"],
+            properties: {
+              title: { type: "string", minLength: 1 },
+              status: { type: "string", enum: TASK_STATUSES, default: "todo" },
+              priority: { type: "string", enum: TASK_PRIORITIES, default: "medium" },
+            },
+          },
+          UpdateTask: {
+            type: "object",
+            properties: {
+              title: { type: "string", minLength: 1 },
+              status: { type: "string", enum: TASK_STATUSES },
+              priority: { type: "string", enum: TASK_PRIORITIES },
+            },
+          },
+          Task: {
+            type: "object",
+            properties: {
+              id: { type: "integer" },
+              userId: { type: "integer" },
+              title: { type: "string" },
+              status: { type: "string", enum: TASK_STATUSES },
+              priority: { type: "string", enum: TASK_PRIORITIES },
+              createdAt: { type: "integer" },
+            },
+          },
+        },
+      },
+      paths: {
+        "/health": {
+          get: { summary: "Health check", responses: { "200": { description: "OK" } } },
+        },
+        "/openapi.json": {
+          get: { summary: "OpenAPI specification", responses: { "200": { description: "Spec JSON" } } },
+        },
+        "/auth/register": {
+          post: {
+            summary: "Register a new user",
+            responses: {
+              "201": { description: "Created" },
+              "400": { description: "Validation failed" },
+              "409": { description: "Email already taken" },
+            },
+          },
+        },
+        "/auth/login": {
+          post: {
+            summary: "Login and obtain bearer token",
+            responses: {
+              "200": { description: "Authenticated" },
+              "400": { description: "Validation failed" },
+              "401": { description: "Invalid email or password" },
+            },
+          },
+        },
+        "/api/tasks": {
+          get: {
+            summary: "List authenticated user's tasks",
+            security: [{ bearerAuth: [] }],
+            responses: { "200": { description: "Paginated tasks" }, "401": { description: "Unauthorized" } },
+          },
+          post: {
+            summary: "Create a task",
+            security: [{ bearerAuth: [] }],
+            responses: { "201": { description: "Created" }, "400": { description: "Validation failed" } },
+          },
+        },
+        "/api/tasks/{id}": {
+          get: {
+            summary: "Get task by id",
+            security: [{ bearerAuth: [] }],
+            responses: { "200": { description: "Task" }, "403": { description: "Forbidden" }, "404": { description: "Not found" } },
+          },
+          patch: {
+            summary: "Update task by id",
+            security: [{ bearerAuth: [] }],
+            responses: { "200": { description: "Updated" }, "403": { description: "Forbidden" }, "404": { description: "Not found" } },
+          },
+          put: {
+            summary: "Replace/update task by id",
+            security: [{ bearerAuth: [] }],
+            responses: { "200": { description: "Updated" }, "403": { description: "Forbidden" }, "404": { description: "Not found" } },
+          },
+          delete: {
+            summary: "Delete task by id",
+            security: [{ bearerAuth: [] }],
+            responses: { "200": { description: "Deleted" }, "403": { description: "Forbidden" }, "404": { description: "Not found" } },
+          },
+        },
+      },
+    });
+  });
 
   // ── Zod şemaları ────────────────────────────────────────────────────────
   const Credentials = z.object({
@@ -137,6 +299,15 @@ export function createApp(db: Db) {
       return fail(c, 400, "invalid pagination parameters");
     }
 
+    const cacheKey =
+      `u:${userId}:s=${statusParam ?? ""}:p=${priorityParam ?? ""}:pg=${page}:l=${limit}`;
+    const cached = taskCache.get(cacheKey);
+    const now = Date.now();
+    if (cached && now < cached.expiresAt) {
+      c.header("X-Cache", "HIT");
+      return c.json(cached.value);
+    }
+
     const conditions = [eq(tasks.userId, userId)];
     if (statusParam !== undefined) {
       conditions.push(eq(tasks.status, statusParam as typeof TASK_STATUSES[number]));
@@ -161,7 +332,10 @@ export function createApp(db: Db) {
       .limit(limit)
       .offset((page - 1) * limit);
 
-    return c.json({ items, page, limit, total });
+    const payload = { items, page, limit, total };
+    taskCache.set(cacheKey, { value: payload, expiresAt: now + CACHE_TTL_MS });
+    c.header("X-Cache", "MISS");
+    return c.json(payload);
   });
 
   // ── POST /api/tasks ─────────────────────────────────────────────────────
@@ -182,6 +356,7 @@ export function createApp(db: Db) {
       })
       .returning();
 
+    invalidateUserTaskCache(userId);
     return c.json(created, 201);
   });
 
@@ -226,6 +401,7 @@ export function createApp(db: Db) {
       .where(and(eq(tasks.id, taskId), eq(tasks.userId, userId)))
       .returning();
 
+    invalidateUserTaskCache(userId);
     return c.json(updated);
   };
 
@@ -242,6 +418,7 @@ export function createApp(db: Db) {
     if (!found.ok) return fail(c, found.status, found.message);
 
     await db.db.delete(tasks).where(and(eq(tasks.id, taskId), eq(tasks.userId, userId)));
+    invalidateUserTaskCache(userId);
     return c.json({ deleted: true, id: taskId });
   });
 
@@ -250,3 +427,4 @@ export function createApp(db: Db) {
 
   return app;
 }
+
