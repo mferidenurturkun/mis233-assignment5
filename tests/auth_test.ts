@@ -60,4 +60,3 @@ Deno.test("POST /auth/login rejects wrong password (401) and returns token on va
   const body = await ok.json();
   assertExists(body.token);
 });
-
